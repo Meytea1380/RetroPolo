@@ -14,6 +14,7 @@ export function getRetroGameCover(consoleId: ConsoleId, title: string, genre: st
     genesis: { bg1: '#042f2e', bg2: '#021817', accent: '#14b8a6', grid: '#134e4a' },
     n64: { bg1: '#422006', bg2: '#1f0d02', accent: '#eab308', grid: '#713f12' },
     ps1: { bg1: '#4c0519', bg2: '#24020c', accent: '#ec4899', grid: '#831843' },
+    ps2: { bg1: '#1e1b4b', bg2: '#0c0a24', accent: '#6366f1', grid: '#3730a3' },
   };
 
   const scheme = colors[consoleId] || colors.snes;

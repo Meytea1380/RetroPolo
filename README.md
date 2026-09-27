@@ -22,14 +22,16 @@
 ├── metadata.json                # Project name, capabilities & permissions
 ├── package.json                 # Dependencies & scripts ("dev": "tsx server.ts", "start": "node server.ts")
 ├── server.ts                    # Express backend + Vite dev middlewares + ROM upload API
+├── testRoms.ts                  # Mini assembler + NES / Game Boy homebrew test ROM builders
 ├── tsconfig.json                # TypeScript compiler options
 ├── vite.config.ts               # Vite configuration with Tailwind 4 plugin
 ├── public/
-│   ├── test-roms/               # Real hardware test ROM binaries generated on server start
-│   │   ├── retro_pilot.nes      # Valid iNES 16KB PRG + 8KB CHR header + reset vectors
-│   │   ├── pocket_monk.gb       # Valid DMG Game Boy 32KB binary with Nintendo logo & checksum
-│   │   ├── speedway.gba         # Valid 32-bit GBA hardware image with ARM boot vectors
-│   │   └── sonic_strike.bin     # Valid 16-bit Sega Genesis M68000 stack & header image
+│   ├── emulator.html            # Isolated EmulatorJS host page (loaded in an iframe by Player.tsx)
+│   ├── ps2.html                 # Play! PlayStation 2 host page (same postMessage protocol)
+│   ├── ps2/                     # Vendored Play! WebAssembly core (Play.js, Play.wasm, LICENSE.txt)
+│   ├── test-roms/               # Homebrew test ROMs rebuilt on server start (see testRoms.ts)
+│   │   ├── retro_pilot.nes      # Runnable NROM test cart (text, movable sprite, beep)
+│   │   └── pocket_monk.gb       # Runnable DMG test cart (text, movable sprite, beep)
 │   └── uploads/                 # Static destination for multipart uploaded user ROMs
 └── src/
     ├── main.tsx                 # React entry mount point
@@ -42,7 +44,7 @@
     │   ├── Library.tsx          # Real-time search, filters, sorting, Grid/List view
     │   ├── GameDetailsModal.tsx # Metadata inspection, achievements, .sav export, in-place edit
     │   ├── UploadGame.tsx       # 3-way upload: Backend API (/api/upload-rom), Real Test ROMs, IndexedDB
-    │   ├── Player.tsx           # Fullscreen player, CRT overlay, Rewind, Multi-slot Saves, Gamepad skins
+    │   ├── Player.tsx           # Fullscreen player: EmulatorJS bridge, CRT overlay, multi-slot saves, gamepad skins, demo engine
     │   ├── CrtOverlay.tsx       # WebGL/CSS CRT shader wrapper: curvature, scanlines, shadow mask, chromatic aberration
     │   ├── CrtStudio.tsx        # CRT lab monitor with SMPTE bars, convergence grid & parameter controls
     │   ├── Settings.tsx         # Theme presets, Web Audio volume, custom keybinding remapper, JSON backup
@@ -136,23 +138,45 @@ Zero external audio MP3/WAV dependencies are required. All sound effects are gen
 | `genesis`| Sega Genesis / Mega Drive | 1988 | `genesis_plus_gx` | 4:3 |
 | `n64` | Nintendo 64 | 1996 | `mupen64plus_next` | 4:3 |
 | `ps1` | Sony PlayStation 1 | 1994 | `mednafen_psx_hw` | 4:3 |
+| `ps2` | Sony PlayStation 2 | 2000 | Play! (`public/ps2.html`) | 4:3 |
 
 ---
 
-## 8. Player & Emulation Engine Dual Architecture
+## 8. Player & Emulation Engine Architecture
 
-The Player component (`src/components/Player.tsx`) operates in two operational modes:
+`src/components/Player.tsx` picks the engine automatically when a game is launched:
 
-1. **Vibe Core (Hardware Arcade Runner)**:
-   - High-performance, zero-latency 60 FPS vector canvas simulation.
-   - Features real-time **Time Rewind** (`Backspace` or on-screen button) using a circular 180-frame state buffer.
-   - Multi-slot save state manager (`Slot 1`, `Slot 2`, `Slot 3`) with `F5` quick save and `F8` quick load.
-   - Background **Auto-Save** running every 30 seconds into Slot 99.
-   - **Skinnable Gamepads**: Toggle on-the-fly between authentic **SNES** (4-button diamond), **NES** (horizontal red 2-button), and **Game Boy** (angled maroon 2-button).
+1. **EJS Core (real emulation, default for every game that has a ROM)**
+   - ROM source is resolved in this order: IndexedDB blob (`retroDb.getRom(game.id)`) -> `game.romBlob` -> `game.romUrl` (server uploads / test ROMs).
+   - EmulatorJS runs inside an isolated iframe (`public/emulator.html`), one iframe per play session, because EmulatorJS keeps global state and cannot be torn down cleanly.
+   - The Player drives it over `postMessage` (`init`, then `cmd` RPCs: `saveState`, `loadState`, `screenshot`, `setVolume`, `setSpeed`, `restart`, `input`). The frame answers with `ready`, `started`, `error`, `result` and forwards the `F5`/`F8` hotkeys.
+   - `ConsoleMeta.ejsCore` maps each console to its EmulatorJS system id (`nes`, `snes`, `gb`, `gba`, `segaMD`, `n64`, `psx`); cores are fetched from `cdn.emulatorjs.org` (internet connection required).
+   - Save states are the raw core state (`application/octet-stream`) stored in IndexedDB slots 1-3, auto-save every 30s into slot 99.
+   - Speed: 1x / 2x / 4x (fast-forward) / 0.5x (slow motion). Physical USB/Bluetooth gamepads work through EmulatorJS' built-in Gamepad API support.
+   - The on-screen virtual gamepad sends RetroPad inputs (`simulateInput`).
+   - Default keyboard: Arrows = D-Pad, Z = A, X = B, Enter = Start, V = Select.
 
-2. **EJS Core (EmulatorJS WebAssembly Core)**:
-   - Clicking the **"Vibe Core / EJS Core"** toggle in the Player HUD switches to loading external WebAssembly Libretro cores dynamically via CDN.
-   - Sets `window.EJS_player`, `window.EJS_core`, and passes `romUrl` or Blob URLs directly to the wasm runtime.
+2. **Vibe Core (arcade demo)**
+   - Used only for library cards without any ROM file (the built-in demo cards) or when the core fails to start and the user chooses the demo.
+   - 60 FPS canvas shooter with rewind (`Backspace`), JSON save states and skinnable gamepad.
+
+### PlayStation 2 (Play! core, experimental)
+EmulatorJS has no PS2 core, so PS2 games run on [Play!](https://github.com/jpd002/Play-) (BSD-2-Clause) compiled to WebAssembly:
+- `public/ps2/Play.js` + `Play.wasm` are vendored from the official web build (`npm run fetch:ps2` re-downloads them; license in `public/ps2/LICENSE.txt`).
+- `public/ps2.html` hosts the core and speaks the same `postMessage` protocol as `emulator.html`; `ConsoleMeta.emulator === 'playjs'` makes the Player load it.
+- The core uses WebAssembly threads (SharedArrayBuffer), so `server.ts` sends `Cross-Origin-Opener-Policy: same-origin` + `Cross-Origin-Embedder-Policy: credentialless` on every response. Safari does not support `credentialless`, so PS2 needs Chrome/Edge/Firefox.
+- No BIOS needed. Supported: `.iso`, `.cso`, `.chd`, `.isz`, `.elf`. Disc images are streamed on demand (`File.slice` for local ROMs, HTTP Range requests for server uploads), so multi-GB ISOs are never loaded fully into memory. Upload limit is 10GB.
+- On upload, `.iso`/`.chd` files larger than 800MB are auto-detected as PS2, smaller ones as PS1.
+- Not supported by the core: save states, speed control, volume. Reset remounts the frame and reboots the disc.
+- Keyboard: Arrows = D-Pad, Z = Cross, X = Circle, A = Square, S = Triangle, Enter = Start, Backspace = Select, 1/2/3 = L1/L2/L3, 8/9/0 = R1/R2/R3, F/H/T/G = left stick, J/L/I/K = right stick. The virtual gamepad maps A/B/X/Y to Circle/Cross/Triangle/Square.
+- Performance is far below desktop PCSX2: many games are slow or do not boot (see the [Play! compatibility list](https://github.com/jpd002/Play-Compatibility/issues)).
+
+### Bundled test cartridges (`testRoms.ts`)
+`server.ts` rebuilds two real homebrew ROMs on every start into `public/test-roms/`:
+- `retro_pilot.nes`: NROM (mapper 0), text rendered with a built-in font, D-Pad moves a sprite, A changes the background color and plays a pulse-channel beep.
+- `pocket_monk.gb`: 32KB ROM-only DMG cart with valid header/global checksums, same D-Pad/A behaviour (A inverts the palette + beep).
+
+They are tiny programs assembled by a helper in `testRoms.ts`, so they exercise the whole pipeline (download -> core -> video -> input -> audio -> save states).
 
 ---
 
@@ -160,8 +184,8 @@ The Player component (`src/components/Player.tsx`) operates in two operational m
 
 If continuing feature development, prioritize the following tasks in order:
 
-1. **Gamepad API Integration**:
-   - Connect standard physical USB / Bluetooth gamepads (Xbox, PlayStation, 8BitDo) via `navigator.getGamepads()` in `Player.tsx`.
+1. **Gamepad API for the demo engine**:
+   - Physical gamepads already work in EJS Core; the Vibe Core demo still reads keyboard only.
 2. **Cheat Code Engine**:
    - Add Game Genie / Action Replay hexadecimal memory patchers inside `GameDetailsModal.tsx` and pass them to the emulation memory space.
 3. **IGDB / ScreenScraper Cover Art Scraping**:

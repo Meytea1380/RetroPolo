@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>RetroPolo PS2 Core</title>
+    <style>
+      html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: #000; overflow: hidden; }
+      #outputCanvas { width: 100%; height: 100%; display: block; object-fit: contain; outline: none; background: #000; }
+      #status {
+        position: absolute; left: 50%; bottom: 14px; transform: translateX(-50%);
+        font: 11px monospace; color: #a3e635; background: rgba(0,0,0,.7);
+        padding: 3px 10px; border-radius: 999px; pointer-events: none;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="outputCanvas" width="640" height="480" tabindex="-1"></canvas>
+    <div id="status"></div>
+    <script type="module">
+      /*
+       * PlayStation 2 host running Play! (https://github.com/jpd002/Play-, BSD-2-Clause) compiled to WebAssembly.
+       * Same postMessage protocol as emulator.html so Player.tsx can drive both:
+       *   Parent -> frame: { type: 'init', gameUrl | romBlob, gameName }  /  { type: 'cmd', id, cmd, arg }
+       *   Frame -> parent: ready / started / error / result / hotkey
+       * The core needs SharedArrayBuffer (pthreads), so the page must be cross-origin isolated
+       * (server.ts sends COOP/COEP headers).
+       */
+      const post = (msg) => parent.postMessage(msg, location.origin);
+      const canvas = document.getElementById('outputCanvas');
+      const statusEl = document.getElementById('status');
+      let started = false;
+      let mod = null;
+
+      /** Streams the disc image on demand instead of loading multi-GB ISOs into memory. */
+      class DiscImageDevice {
+        constructor(module) {
+          this.module = module;
+          this.doneFlag = false;
+          this.file = null;
+        }
+        read(dst, pos, size) {
+          if (!this.file) throw new Error('No file set.');
+          this.doneFlag = false;
+          this.file.slice(pos, pos + size).arrayBuffer().then((buf) => {
+            this.module.HEAPU8.set(new Uint8Array(buf), dst);
+            this.doneFlag = true;
+          });
+        }
+        getFileSize() {
+          if (!this.file) throw new Error('No file set.');
+          return this.file.size;
+        }
+        isDone() {
+          return this.doneFlag;
+        }
+        setFile(file) {
+          this.file = file;
+        }
+      }
+
+      /** File-like wrapper over a server URL using HTTP Range requests (for ISOs uploaded to the backend). */
+      async function remoteFile(url) {
+        const head = await fetch(url, { method: 'HEAD' });
+        if (!head.ok) throw new Error(`ROM not found on server (HTTP ${head.status})`);
+        const size = Number(head.headers.get('content-length'));
+        if (!size) throw new Error('Server did not report the ROM size');
+        return {
+          size,
+          slice(start, end) {
+            return {
+              arrayBuffer: async () => {
+                const res = await fetch(url, { headers: { Range: `bytes=${start}-${Math.min(end, size) - 1}` } });
+                if (res.status !== 206 && res.status !== 200) throw new Error('Range request failed');
+                const buf = await res.arrayBuffer();
+                return res.status === 200 ? buf.slice(start, end) : buf;
+              },
+            };
+          },
+        };
+      }
+
+      async function init(opts) {
+        try {
+          if (!window.crossOriginIsolated || typeof SharedArrayBuffer === 'undefined') {
+            throw new Error('PS2 core needs a cross-origin isolated page (SharedArrayBuffer). Use a recent Chrome, Edge or Firefox and open the app through the RetroPolo server.');
+          }
+          const name = opts.gameName || 'game.iso';
+          const dot = name.lastIndexOf('.');
+          if (dot < 0) throw new Error('ROM file name must have an extension (.iso, .cso, .chd, .isz, .bin, .elf)');
+          const ext = name.substring(dot).toLowerCase();
+
+          statusEl.textContent = 'Loading PS2 core…';
+          const { default: Play } = await import('/ps2/Play.js');
+          mod = await Play({
+            locateFile: (p) => `${location.origin}/ps2/${p}`,
+            mainScriptUrlOrBlob: `${location.origin}/ps2/Play.js`,
+            print: (t) => console.log('[Play!]', t),
+            printErr: (t) => console.warn('[Play!]', t),
+          });
+          mod.FS.mkdir('/work');
+          mod.discImageDevice = new DiscImageDevice(mod);
+          mod.ccall('initVm', '', [], []);
+
+          const file = opts.romBlob || (await remoteFile(opts.gameUrl));
+          statusEl.textContent = 'Booting disc…';
+          if (ext === '.elf') {
+            const data = new Uint8Array(await file.slice(0, file.size).arrayBuffer());
+            const fd = mod.FS.open(name, 'w+');
+            mod.FS.write(fd, data, 0, data.length, 0);
+            mod.FS.close(fd);
+            mod.bootElf(name);
+          } else {
+            mod.discImageDevice.setFile(file);
+            mod.bootDiscImage(name);
+          }
+
+          started = true;
+          canvas.focus();
+          post({ type: 'started' });
+
+          // FPS readout
+          setInterval(() => {
+            const fps = mod.getFrames();
+            mod.clearStats();
+            statusEl.textContent = `${fps} f/s`;
+          }, 1000);
+        } catch (err) {
+          statusEl.textContent = '';
+          post({ type: 'error', message: String((err && err.message) || err) });
+        }
+      }
+
+      // RetroPad index -> keyboard code bound by Play! (see Source/ui_js/Main.cpp upstream)
+      const PAD_KEYS = {
+        0: 'KeyZ', // B     -> Cross
+        8: 'KeyX', // A     -> Circle
+        1: 'KeyA', // Y     -> Square
+        9: 'KeyS', // X     -> Triangle
+        2: 'Backspace', // Select
+        3: 'Enter', // Start
+        4: 'ArrowUp',
+        5: 'ArrowDown',
+        6: 'ArrowLeft',
+        7: 'ArrowRight',
+        10: 'Digit1', // L1
+        11: 'Digit8', // R1
+      };
+      // Play! compares KeyboardEvent.code against "Key0".."Key9" for digits, so send those names
+      const CODE_ALIASES = { Digit1: 'Key1', Digit8: 'Key8' };
+
+      function pressKey(code, down) {
+        const c = CODE_ALIASES[code] || code;
+        canvas.dispatchEvent(new KeyboardEvent(down ? 'keydown' : 'keyup', { code: c, key: c, bubbles: true }));
+      }
+
+      // Physical number keys arrive as "Digit1"; translate them to what the core expects
+      for (const type of ['keydown', 'keyup']) {
+        canvas.addEventListener(
+          type,
+          (e) => {
+            if (e.isTrusted && /^Digit[0-9]$/.test(e.code)) {
+              e.stopImmediatePropagation();
+              e.preventDefault();
+              if (!e.repeat) canvas.dispatchEvent(new KeyboardEvent(type, { code: 'Key' + e.code.slice(5), bubbles: true }));
+            }
+          },
+          true,
+        );
+      }
+
+      async function run(cmd, arg) {
+        if (!started) throw new Error('PS2 core is still starting');
+        switch (cmd) {
+          case 'input': {
+            const code = PAD_KEYS[arg.index];
+            if (code) pressKey(code, !!arg.value);
+            return true;
+          }
+          case 'screenshot':
+            return await new Promise((resolve, reject) => {
+              requestAnimationFrame(() =>
+                canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('Screenshot failed'))), 'image/png'),
+              );
+            });
+          case 'restart':
+            setTimeout(() => location.reload(), 0);
+            return true;
+          case 'focus':
+            canvas.focus();
+            return true;
+          default:
+            throw new Error(`"${cmd}" is not supported by the PS2 core`);
+        }
+      }
+
+      window.addEventListener('message', async (ev) => {
+        if (ev.origin !== location.origin || ev.source !== parent) return;
+        const msg = ev.data || {};
+        if (msg.type === 'init') {
+          init(msg);
+        } else if (msg.type === 'cmd') {
+          try {
+            const data = await run(msg.cmd, msg.arg);
+            post({ type: 'result', id: msg.id, ok: true, data });
+          } catch (err) {
+            post({ type: 'result', id: msg.id, ok: false, error: String((err && err.message) || err) });
+          }
+        }
+      });
+
+      window.addEventListener(
+        'keydown',
+        (e) => {
+          if (e.code === 'F5' || e.code === 'F8') {
+            e.preventDefault();
+            post({ type: 'hotkey', key: e.code });
+          }
+        },
+        true,
+      );
+      document.addEventListener('mousedown', () => canvas.focus());
+
+      post({ type: 'ready' });
+    </script>
+  </body>
+</html>

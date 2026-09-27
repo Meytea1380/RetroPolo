@@ -1,4 +1,4 @@
-export type ConsoleId = 'nes' | 'snes' | 'gb' | 'gbc' | 'gba' | 'genesis' | 'n64' | 'ps1';
+export type ConsoleId = 'nes' | 'snes' | 'gb' | 'gbc' | 'gba' | 'genesis' | 'n64' | 'ps1' | 'ps2';
 
 export interface ConsoleMeta {
   id: ConsoleId;
@@ -13,6 +13,10 @@ export interface ConsoleMeta {
   icon: string;
   extensions: string[];
   coreName: string;
+  /** EmulatorJS system id passed as EJS_core (EmulatorJS picks the best libretro core for it) */
+  ejsCore: string;
+  /** Which emulator host runs this console: EmulatorJS (default) or the Play! PS2 core */
+  emulator?: 'emulatorjs' | 'playjs';
   nativeAspect: string;
 }
 

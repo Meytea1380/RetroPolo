@@ -18,7 +18,7 @@ export const Hero: React.FC<HeroProps> = ({
   featuredGames,
   onPlayGame,
 }) => {
-  const consoleKeys: ConsoleId[] = ['nes', 'snes', 'gb', 'gba', 'genesis', 'n64', 'ps1'];
+  const consoleKeys: ConsoleId[] = ['nes', 'snes', 'gb', 'gba', 'genesis', 'n64', 'ps1', 'ps2'];
 
   return (
     <div className="relative overflow-hidden pt-8 pb-16 md:pt-16 md:pb-24">

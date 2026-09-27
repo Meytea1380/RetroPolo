@@ -40,8 +40,10 @@ export const UploadGame: React.FC<UploadGameProps> = ({ onGameAdded, onCancel })
   }, []);
 
   // Auto detect console from file extension
-  const detectConsole = (filename: string): ConsoleId => {
+  const detectConsole = (filename: string, size = 0): ConsoleId => {
     const ext = '.' + filename.split('.').pop()?.toLowerCase();
+    // .iso/.chd are shared by PS1 and PS2: PS1 discs never exceed ~800MB, PS2 DVDs usually do
+    if (['.iso', '.chd'].includes(ext)) return size > 800 * 1024 * 1024 ? 'ps2' : 'ps1';
     for (const [cId, meta] of Object.entries(CONSOLES)) {
       if (meta.extensions.includes(ext)) {
         return cId as ConsoleId;
@@ -60,7 +62,7 @@ export const UploadGame: React.FC<UploadGameProps> = ({ onGameAdded, onCancel })
     const cleanTitle = rawName.replace(/[\-_]/g, ' ').replace(/\(.*\)|\[.*\]/g, '').trim();
     setGameTitle(cleanTitle || 'Custom Game');
 
-    const consoleDetected = detectConsole(file.name);
+    const consoleDetected = detectConsole(file.name, file.size);
     setDetectedConsole(consoleDetected);
     setGameYear(CONSOLES[consoleDetected].year);
   };
@@ -350,7 +352,7 @@ export const UploadGame: React.FC<UploadGameProps> = ({ onGameAdded, onCancel })
                 }
               }}
               className="hidden"
-              accept=".nes,.snes,.smc,.sfc,.gb,.gbc,.gba,.md,.bin,.gen,.z64,.n64,.v64,.iso,.cue,.chd,.zip"
+              accept=".nes,.snes,.smc,.sfc,.gb,.gbc,.gba,.md,.bin,.gen,.z64,.n64,.v64,.iso,.cue,.chd,.pbp,.cso,.isz,.elf,.zip"
             />
 
             {selectedFile ? (
@@ -375,7 +377,7 @@ export const UploadGame: React.FC<UploadGameProps> = ({ onGameAdded, onCancel })
                   Drag & drop your ROM file here, or click to browse
                 </span>
                 <span className="text-xs text-zinc-500 font-mono mt-2">
-                  Supports .nes, .smc, .sfc, .gb, .gbc, .gba, .md, .z64, .chd
+                  Supports .nes, .smc, .sfc, .gb, .gbc, .gba, .md, .z64, .chd, PS2 .iso / .cso
                 </span>
               </div>
             )}
