@@ -1,0 +1,6 @@
+{
+  "name": "RetroVibe Emulator",
+  "description": "High-performance browser retro console emulator with CRT post-processing, game library management, and save state preservation.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
