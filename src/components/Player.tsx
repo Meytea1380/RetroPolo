@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { GameItem, CrtSettings, ControllerSkin } from '../types';
 import { CONSOLES } from '../utils/constants';
 import { CrtOverlay } from './CrtOverlay';
@@ -17,7 +17,7 @@ import {
   X,
   Gamepad,
   Cpu,
-  Layers,
+  AlertTriangle,
 } from 'lucide-react';
 
 interface PlayerProps {
@@ -25,6 +25,55 @@ interface PlayerProps {
   crtSettings: CrtSettings;
   onExit: () => void;
   onSaveStateSaved?: () => void;
+}
+
+/** 'ejs' = real ROM running on an EmulatorJS (libretro WebAssembly) core, 'vibe' = built-in arcade demo for cards without a ROM */
+type Engine = 'resolving' | 'ejs' | 'vibe';
+type CoreStatus = 'booting' | 'running' | 'error';
+
+interface RomSource {
+  blob?: Blob;
+  url?: string;
+  fileName: string;
+}
+
+/** RetroPad button indexes understood by EmulatorJS simulateInput() */
+const RETROPAD: Record<string, number> = {
+  B: 0,
+  Y: 1,
+  SELECT: 2,
+  START: 3,
+  UP: 4,
+  DOWN: 5,
+  LEFT: 6,
+  RIGHT: 7,
+  A: 8,
+  X: 9,
+};
+
+const EJS_VOLUME = 0.8;
+const SPEEDS = [1, 2, 4, 0.5];
+
+async function resolveRomSource(game: GameItem): Promise<RomSource | null> {
+  const ext = CONSOLES[game.consoleId].extensions[0] || '.bin';
+  const safeTitle = game.title.replace(/[^a-zA-Z0-9_-]+/g, '_') || 'game';
+
+  let stored: Blob | ArrayBuffer | null = null;
+  try {
+    stored = await retroDb.getRom(game.id);
+  } catch {}
+  const blob = stored ? (stored instanceof Blob ? stored : new Blob([stored])) : game.romBlob;
+  if (blob) {
+    const name = blob instanceof File && blob.name ? blob.name : `${safeTitle}${ext}`;
+    return { blob, fileName: name };
+  }
+
+  if (game.romUrl) {
+    const url = new URL(game.romUrl, window.location.href).href;
+    const last = decodeURIComponent(url.split('/').pop()?.split('?')[0] || '');
+    return { url, fileName: last.includes('.') ? last : `${safeTitle}${ext}` };
+  }
+  return null;
 }
 
 export const Player: React.FC<PlayerProps> = ({
@@ -35,7 +84,7 @@ export const Player: React.FC<PlayerProps> = ({
 }) => {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const ejsContainerRef = useRef<HTMLDivElement | null>(null);
+  const frameRef = useRef<HTMLIFrameElement | null>(null);
 
   const [fps, setFps] = useState(60);
   const [speed, setSpeed] = useState<number>(1);
@@ -46,16 +95,28 @@ export const Player: React.FC<PlayerProps> = ({
   const [saveSlot, setSaveSlot] = useState<number>(1);
   const [saveNotification, setSaveNotification] = useState<string | null>(null);
   const [isRewinding, setIsRewinding] = useState(false);
-  const [useEmulatorJs, setUseEmulatorJs] = useState(false);
-  const [emulatorJsLoading, setEmulatorJsLoading] = useState(false);
+
+  const [engine, setEngine] = useState<Engine>('resolving');
+  const [coreStatus, setCoreStatus] = useState<CoreStatus>('booting');
+  const [coreError, setCoreError] = useState<string | null>(null);
+  const [romSource, setRomSource] = useState<RomSource | null>(null);
+  const [frameNonce, setFrameNonce] = useState(0);
+
+  // PS2 runs on the Play! core (public/ps2.html): no save states, speed or volume control
+  const isPlayCore = CONSOLES[game.consoleId].emulator === 'playjs';
+  const coreLabel = isPlayCore ? 'Play! PS2' : 'EmulatorJS';
 
   const hudTimeoutRef = useRef<number | null>(null);
-  const autoSaveTimerRef = useRef<number | null>(null);
+  const notifyTimeoutRef = useRef<number | null>(null);
+
+  // Pending RPC calls into the emulator iframe
+  const rpcIdRef = useRef(0);
+  const pendingRef = useRef(new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void }>());
 
   // Rewind circular history buffer
   const rewindHistoryRef = useRef<any[]>([]);
 
-  // Interactive arcade engine state
+  // Interactive arcade engine state (demo mode)
   const gameStateRef = useRef({
     score: 1240,
     lives: 3,
@@ -70,23 +131,218 @@ export const Player: React.FC<PlayerProps> = ({
 
   const notify = (msg: string) => {
     setSaveNotification(msg);
-    setTimeout(() => setSaveNotification(null), 2500);
+    if (notifyTimeoutRef.current) clearTimeout(notifyTimeoutRef.current);
+    notifyTimeoutRef.current = window.setTimeout(() => setSaveNotification(null), 2500);
   };
 
-  // Keyboard controls
+  // ---------------------------------------------------------------------------
+  // Emulator bridge (public/emulator.html runs EmulatorJS inside an iframe)
+  // ---------------------------------------------------------------------------
+  const callCore = useCallback(<T = any,>(cmd: string, arg?: any, transfer: Transferable[] = []): Promise<T> => {
+    const win = frameRef.current?.contentWindow;
+    if (!win) return Promise.reject(new Error('Emulator frame not available'));
+    const id = ++rpcIdRef.current;
+    return new Promise<T>((resolve, reject) => {
+      pendingRef.current.set(id, { resolve, reject });
+      win.postMessage({ type: 'cmd', id, cmd, arg }, window.location.origin, transfer);
+      window.setTimeout(() => {
+        if (pendingRef.current.delete(id)) reject(new Error(`Emulator did not answer "${cmd}"`));
+      }, 10000);
+    });
+  }, []);
+
+  // Pick the engine: real emulator when the game has a ROM, arcade demo otherwise
+  useEffect(() => {
+    let cancelled = false;
+    setEngine('resolving');
+    setCoreStatus('booting');
+    setCoreError(null);
+    resolveRomSource(game).then((src) => {
+      if (cancelled) return;
+      setRomSource(src);
+      setEngine(src ? 'ejs' : 'vibe');
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [game]);
+
+  // Latest handlers for listeners that are registered once
+  const actionsRef = useRef({ save: () => {}, load: () => {} });
+
+  // Messages coming back from the emulator iframe
+  useEffect(() => {
+    if (engine !== 'ejs' || !romSource) return;
+
+    const onMessage = (ev: MessageEvent) => {
+      if (ev.origin !== window.location.origin || ev.source !== frameRef.current?.contentWindow) return;
+      const msg = ev.data || {};
+      switch (msg.type) {
+        case 'ready':
+          frameRef.current?.contentWindow?.postMessage(
+            {
+              type: 'init',
+              core: CONSOLES[game.consoleId].ejsCore,
+              gameUrl: romSource.url,
+              romBlob: romSource.blob,
+              gameName: romSource.fileName,
+              gameId: game.id,
+              volume: soundMuted ? 0 : EJS_VOLUME,
+            },
+            window.location.origin,
+          );
+          break;
+        case 'started':
+          setCoreStatus('running');
+          frameRef.current?.focus();
+          frameRef.current?.contentWindow?.focus();
+          break;
+        case 'error':
+          setCoreStatus('error');
+          setCoreError(msg.message || 'Emulator failed to start');
+          break;
+        case 'result': {
+          const p = pendingRef.current.get(msg.id);
+          if (!p) break;
+          pendingRef.current.delete(msg.id);
+          if (msg.ok) p.resolve(msg.data);
+          else p.reject(new Error(msg.error || 'Emulator command failed'));
+          break;
+        }
+        case 'hotkey':
+          if (msg.key === 'F5') actionsRef.current.save();
+          else if (msg.key === 'F8') actionsRef.current.load();
+          break;
+      }
+    };
+
+    window.addEventListener('message', onMessage);
+    return () => window.removeEventListener('message', onMessage);
+    // soundMuted is only read for the initial volume
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [engine, romSource, game.id, game.consoleId]);
+
+  // Reject any in-flight calls when the player closes
+  useEffect(() => {
+    const pending = pendingRef.current;
+    return () => {
+      pending.forEach((p) => p.reject(new Error('Player closed')));
+      pending.clear();
+    };
+  }, []);
+
+  // ---------------------------------------------------------------------------
+  // Save / load / screenshot
+  // ---------------------------------------------------------------------------
+  const handleSaveState = async (slot = saveSlot, silent = false) => {
+    if (engine === 'ejs' && isPlayCore) {
+      if (!silent) notify('Save states are not supported by the PS2 core');
+      return;
+    }
+    if (!silent) soundFx.playPowerUp();
+    try {
+      let blob: Blob;
+      if (engine === 'ejs') {
+        if (coreStatus !== 'running') throw new Error('not running');
+        const buf = await callCore<ArrayBuffer>('saveState');
+        blob = new Blob([buf], { type: 'application/octet-stream' });
+      } else {
+        const stateObj = { gameState: gameStateRef.current, timestamp: new Date().toISOString() };
+        blob = new Blob([JSON.stringify(stateObj)], { type: 'application/json' });
+      }
+      await retroDb.saveGameState(game.id, slot, blob);
+      if (!silent) {
+        notify(`Saved state to Slot #${slot}`);
+        if (onSaveStateSaved) onSaveStateSaved();
+      }
+    } catch {
+      if (!silent) notify('Failed to save state');
+    }
+  };
+
+  const handleLoadState = async (slot = saveSlot) => {
+    if (engine === 'ejs' && isPlayCore) {
+      notify('Save states are not supported by the PS2 core');
+      return;
+    }
+    soundFx.playCoin();
+    try {
+      const data = await retroDb.getGameState(game.id, slot);
+      if (!data) {
+        notify(`No save found in Slot #${slot}`);
+        return;
+      }
+      const blob = data instanceof Blob ? data : new Blob([data]);
+      const isJson = blob.type === 'application/json';
+
+      if (engine === 'ejs') {
+        if (isJson) {
+          notify(`Slot #${slot} holds a demo-mode save`);
+          return;
+        }
+        const buf = await blob.arrayBuffer();
+        await callCore('loadState', buf, [buf]);
+        notify(`Loaded state from Slot #${slot}`);
+        return;
+      }
+
+      if (!isJson) {
+        notify(`Slot #${slot} holds an emulator save`);
+        return;
+      }
+      const parsed = JSON.parse(await blob.text());
+      if (parsed?.gameState) {
+        gameStateRef.current.score = parsed.gameState.score || 0;
+        gameStateRef.current.shipX = parsed.gameState.shipX || 160;
+        gameStateRef.current.shipY = parsed.gameState.shipY || 200;
+        notify(`Loaded state from Slot #${slot}`);
+      }
+    } catch {
+      notify('Failed to load state');
+    }
+  };
+
+  actionsRef.current = { save: () => handleSaveState(), load: () => handleLoadState() };
+
+  const downloadImage = (href: string) => {
+    const a = document.createElement('a');
+    a.href = href;
+    a.download = `${game.title.replace(/[^a-zA-Z0-9_-]+/g, '_')}_screenshot.png`;
+    a.click();
+  };
+
+  const takeScreenshot = async () => {
+    soundFx.playClick();
+    try {
+      if (engine === 'ejs') {
+        const blob = await callCore<Blob>('screenshot');
+        const url = URL.createObjectURL(blob);
+        downloadImage(url);
+        setTimeout(() => URL.revokeObjectURL(url), 5000);
+      } else {
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+        downloadImage(canvas.toDataURL('image/png'));
+      }
+      notify('Screenshot captured');
+    } catch {
+      notify('Screenshot failed');
+    }
+  };
+
+  // Keyboard hotkeys while focus is in the shell (the iframe forwards F5/F8 itself)
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       gameStateRef.current.keys[e.code] = true;
       gameStateRef.current.keys[e.key] = true;
 
-      // Hotkeys
       if (e.code === 'F5') {
         e.preventDefault();
-        handleSaveState();
+        actionsRef.current.save();
       } else if (e.code === 'F8') {
         e.preventDefault();
-        handleLoadState();
-      } else if (e.code === 'Backspace') {
+        actionsRef.current.load();
+      } else if (e.code === 'Backspace' && engine === 'vibe') {
         setIsRewinding(true);
       }
     };
@@ -94,39 +350,39 @@ export const Player: React.FC<PlayerProps> = ({
     const handleKeyUp = (e: KeyboardEvent) => {
       gameStateRef.current.keys[e.code] = false;
       gameStateRef.current.keys[e.key] = false;
-      if (e.code === 'Backspace') {
-        setIsRewinding(false);
-      }
+      if (e.code === 'Backspace') setIsRewinding(false);
     };
 
     window.addEventListener('keydown', handleKeyDown);
     window.addEventListener('keyup', handleKeyUp);
-
     return () => {
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('keyup', handleKeyUp);
     };
-  }, [saveSlot]);
+  }, [engine]);
 
-  // Auto-save every 30 seconds
+  // Auto-save every 30 seconds into Slot 99
   useEffect(() => {
-    autoSaveTimerRef.current = window.setInterval(async () => {
-      try {
-        const stateObj = {
-          gameState: gameStateRef.current,
-          timestamp: new Date().toISOString(),
-          autoSave: true,
-        };
-        const blob = new Blob([JSON.stringify(stateObj)], { type: 'application/json' });
-        await retroDb.saveGameState(game.id, 99, blob); // Slot 99 = AutoSave
-        notify('Auto-Saved state (30s interval)');
-      } catch {}
+    if (engine === 'resolving' || (engine === 'ejs' && (coreStatus !== 'running' || isPlayCore))) return;
+    const timer = window.setInterval(() => {
+      handleSaveState(99, true);
     }, 30000);
+    return () => clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [game.id, engine, coreStatus]);
 
-    return () => {
-      if (autoSaveTimerRef.current) clearInterval(autoSaveTimerRef.current);
-    };
-  }, [game.id]);
+  // Push mute / speed changes into the running core
+  useEffect(() => {
+    if (engine === 'ejs' && coreStatus === 'running') {
+      callCore('setVolume', soundMuted ? 0 : EJS_VOLUME).catch(() => {});
+    }
+  }, [soundMuted, engine, coreStatus, callCore]);
+
+  useEffect(() => {
+    if (engine === 'ejs' && coreStatus === 'running') {
+      callCore('setSpeed', speed).catch(() => {});
+    }
+  }, [speed, engine, coreStatus, callCore]);
 
   // Hide HUD after mouse idle
   const handleMouseMove = () => {
@@ -139,6 +395,13 @@ export const Player: React.FC<PlayerProps> = ({
 
   // Virtual Gamepad button triggers
   const handleVirtualButton = (btn: string, pressed: boolean) => {
+    if (engine === 'ejs') {
+      const index = RETROPAD[btn];
+      if (index !== undefined && coreStatus === 'running') {
+        callCore('input', { index, value: pressed ? 1 : 0 }).catch(() => {});
+      }
+      return;
+    }
     if (pressed && !soundMuted) soundFx.playClick();
     if (btn === 'LEFT') gameStateRef.current.keys['ArrowLeft'] = pressed;
     if (btn === 'RIGHT') gameStateRef.current.keys['ArrowRight'] = pressed;
@@ -148,9 +411,40 @@ export const Player: React.FC<PlayerProps> = ({
     if (btn === 'X' || btn === 'Y') gameStateRef.current.keys['KeyX'] = pressed;
   };
 
+  const handleRestart = () => {
+    soundFx.playClick();
+    if (engine === 'ejs' && isPlayCore) {
+      // The PS2 host has no soft reset: remount its frame and boot the disc again
+      setCoreStatus('booting');
+      setFrameNonce((n) => n + 1);
+    } else if (engine === 'ejs') {
+      callCore('restart').then(() => notify('Console reset')).catch(() => {});
+    } else {
+      gameStateRef.current.score = 0;
+      gameStateRef.current.enemies = [];
+      rewindHistoryRef.current = [];
+      notify('Demo reset');
+    }
+  };
+
+  const toggleFullscreen = () => {
+    soundFx.playClick();
+    if (!document.fullscreenElement) {
+      containerRef.current?.requestFullscreen();
+    } else {
+      document.exitFullscreen();
+    }
+  };
+
+  // Fall back to the arcade demo if the real core cannot start
+  const handlePlayDemoInstead = () => {
+    soundFx.playClick();
+    setEngine('vibe');
+  };
+
   // Main canvas render & game loop with rewind support
   useEffect(() => {
-    if (useEmulatorJs) return;
+    if (engine !== 'vibe') return;
 
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -346,122 +640,7 @@ export const Player: React.FC<PlayerProps> = ({
     return () => {
       cancelAnimationFrame(animId);
     };
-  }, [useEmulatorJs, game, speed, soundMuted, isRewinding]);
-
-  // Save State Action
-  const handleSaveState = async () => {
-    soundFx.playPowerUp();
-    try {
-      const stateObj = {
-        gameState: gameStateRef.current,
-        timestamp: new Date().toISOString(),
-      };
-      const jsonStr = JSON.stringify(stateObj);
-      const blob = new Blob([jsonStr], { type: 'application/json' });
-      await retroDb.saveGameState(game.id, saveSlot, blob);
-      notify(`Saved state to Slot #${saveSlot}`);
-      if (onSaveStateSaved) onSaveStateSaved();
-    } catch {
-      notify('Failed to save state');
-    }
-  };
-
-  // Load State Action
-  const handleLoadState = async () => {
-    soundFx.playCoin();
-    try {
-      const data = await retroDb.getGameState(game.id, saveSlot);
-      if (!data) {
-        notify(`No save found in Slot #${saveSlot}`);
-        return;
-      }
-
-      let parsed: any;
-      if (data instanceof Blob) {
-        const text = await data.text();
-        parsed = JSON.parse(text);
-      } else {
-        parsed = JSON.parse(new TextDecoder().decode(data));
-      }
-
-      if (parsed?.gameState) {
-        gameStateRef.current.score = parsed.gameState.score || 0;
-        gameStateRef.current.shipX = parsed.gameState.shipX || 160;
-        gameStateRef.current.shipY = parsed.gameState.shipY || 200;
-        notify(`Loaded state from Slot #${saveSlot}`);
-      }
-    } catch {
-      notify('Failed to load state');
-    }
-  };
-
-  // Screenshot Action
-  const takeScreenshot = () => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    soundFx.playClick();
-    const dataUrl = canvas.toDataURL('image/png');
-    const a = document.createElement('a');
-    a.href = dataUrl;
-    a.download = `${game.title.replace(/\s+/g, '_')}_screenshot.png`;
-    a.click();
-    notify('Screenshot captured');
-  };
-
-  // Fullscreen Action
-  const toggleFullscreen = () => {
-    soundFx.playClick();
-    if (!document.fullscreenElement) {
-      containerRef.current?.requestFullscreen();
-    } else {
-      document.exitFullscreen();
-    }
-  };
-
-  // EmulatorJS Loader for ROMs
-  const handleToggleCore = async () => {
-    soundFx.playClick();
-    if (!useEmulatorJs) {
-      setEmulatorJsLoading(true);
-      setUseEmulatorJs(true);
-      // Retrieve ROM from indexedDB if available
-      try {
-        const romData = await retroDb.getRom(game.id);
-        let romSrcUrl = game.romUrl;
-        if (romData instanceof Blob) {
-          romSrcUrl = URL.createObjectURL(romData);
-        }
-
-        // Configure window EJS global variables
-        const w = window as any;
-        w.EJS_player = '#ejs-game-container';
-        w.EJS_core = CONSOLES[game.consoleId].coreName || 'fceumm';
-        w.EJS_gameUrl = romSrcUrl || '';
-        w.EJS_pathtodata = 'https://cdn.emulatorjs.org/stable/data/';
-        w.EJS_startOnLoaded = true;
-
-        if (!document.getElementById('emulatorjs-script')) {
-          const script = document.createElement('script');
-          script.id = 'emulatorjs-script';
-          script.src = 'https://cdn.emulatorjs.org/stable/data/loader.js';
-          script.onload = () => setEmulatorJsLoading(false);
-          script.onerror = () => {
-            setEmulatorJsLoading(false);
-            notify('EmulatorJS core CDN offline, reverting to hardware runner');
-            setUseEmulatorJs(false);
-          };
-          document.body.appendChild(script);
-        } else {
-          setEmulatorJsLoading(false);
-        }
-      } catch {
-        setEmulatorJsLoading(false);
-        setUseEmulatorJs(false);
-      }
-    } else {
-      setUseEmulatorJs(false);
-    }
-  };
+  }, [engine, game, speed, soundMuted, isRewinding]);
 
   return (
     <div
@@ -503,7 +682,13 @@ export const Player: React.FC<PlayerProps> = ({
               <div className="flex items-center gap-2 text-[10px] font-mono text-zinc-400">
                 <span className="text-[#a855f7]">{CONSOLES[game.consoleId].shortName}</span>
                 <span>·</span>
-                <span className="text-[#a3e635]">{fps} FPS</span>
+                {engine === 'ejs' ? (
+                  <span className={coreStatus === 'error' ? 'text-red-400' : 'text-[#a3e635]'}>
+                    {coreStatus === 'running' ? coreLabel : coreStatus === 'error' ? 'Core error' : 'Booting core…'}
+                  </span>
+                ) : (
+                  <span className="text-[#a3e635]">{engine === 'vibe' ? `Demo · ${fps} FPS` : '…'}</span>
+                )}
                 <span>·</span>
                 <span className="text-[#06b6d4]">Slot #{saveSlot}</span>
               </div>
@@ -513,6 +698,7 @@ export const Player: React.FC<PlayerProps> = ({
           {/* Controls Bar */}
           <div className="flex items-center gap-1.5 sm:gap-2">
             {/* Slot Picker */}
+            {!(engine === 'ejs' && isPlayCore) && (
             <div className="flex items-center bg-zinc-900/90 border border-zinc-800 rounded-lg px-2 py-1 text-xs font-mono">
               <span className="text-zinc-500 text-[10px] mr-1 hidden sm:inline">SLOT:</span>
               {[1, 2, 3].map((slot) => (
@@ -531,7 +717,10 @@ export const Player: React.FC<PlayerProps> = ({
               ))}
             </div>
 
-            {/* Rewind */}
+            )}
+
+            {/* Rewind (demo engine only) */}
+            {engine === 'vibe' && (
             <button
               onMouseDown={() => setIsRewinding(true)}
               onMouseUp={() => setIsRewinding(false)}
@@ -547,15 +736,27 @@ export const Player: React.FC<PlayerProps> = ({
               <Rewind className="w-3.5 h-3.5 text-[#06b6d4]" />
               <span className="hidden md:inline">Rewind</span>
             </button>
+            )}
 
-            {/* Speed Selector */}
+            {/* Reset */}
+            <button
+              onClick={handleRestart}
+              className="p-1.5 text-zinc-400 hover:text-white bg-zinc-900/80 rounded-lg border border-zinc-800 cursor-pointer"
+              title="Reset Console"
+            >
+              <RotateCcw className="w-4 h-4" />
+            </button>
+
+            {/* Speed Selector / Save / Load (not available on the PS2 core) */}
+            {!(engine === 'ejs' && isPlayCore) && (
+            <>
             <button
               onClick={() => {
                 soundFx.playClick();
-                setSpeed((s) => (s === 1 ? 2 : s === 2 ? 0.5 : 1));
+                setSpeed((s) => SPEEDS[(SPEEDS.indexOf(s) + 1) % SPEEDS.length]);
               }}
               className="px-2 py-1.5 text-xs font-mono bg-zinc-900/80 hover:bg-zinc-800 text-zinc-300 rounded-lg border border-zinc-800 flex items-center gap-1 cursor-pointer"
-              title="Toggle Emulation Speed (0.5x, 1x, 2x)"
+              title="Toggle Emulation Speed (1x, 2x, 4x, 0.5x)"
             >
               <FastForward className="w-3.5 h-3.5 text-[#06b6d4]" />
               <span>{speed}x</span>
@@ -563,7 +764,7 @@ export const Player: React.FC<PlayerProps> = ({
 
             {/* Save State Button */}
             <button
-              onClick={handleSaveState}
+              onClick={() => handleSaveState()}
               className="px-2 py-1.5 text-xs font-mono bg-zinc-900/80 hover:bg-zinc-800 text-zinc-300 rounded-lg border border-zinc-800 flex items-center gap-1 cursor-pointer"
               title="Save State (F5)"
             >
@@ -573,13 +774,16 @@ export const Player: React.FC<PlayerProps> = ({
 
             {/* Load State Button */}
             <button
-              onClick={handleLoadState}
+              onClick={() => handleLoadState()}
               className="px-2 py-1.5 text-xs font-mono bg-zinc-900/80 hover:bg-zinc-800 text-zinc-300 rounded-lg border border-zinc-800 flex items-center gap-1 cursor-pointer"
               title="Load State (F8)"
             >
               <Download className="w-3.5 h-3.5 text-[#a3e635]" />
               <span className="hidden sm:inline">Load</span>
             </button>
+
+            </>
+            )}
 
             {/* Screenshot */}
             <button
@@ -591,6 +795,7 @@ export const Player: React.FC<PlayerProps> = ({
             </button>
 
             {/* Mute Audio */}
+            {!(engine === 'ejs' && isPlayCore) && (
             <button
               onClick={() => {
                 const next = !soundMuted;
@@ -606,20 +811,26 @@ export const Player: React.FC<PlayerProps> = ({
                 <Volume2 className="w-4 h-4 text-[#a3e635]" />
               )}
             </button>
+            )}
 
-            {/* Core Switcher (EmulatorJS vs Hardware Arcade) */}
-            <button
-              onClick={handleToggleCore}
-              className={`p-1.5 rounded-lg border transition-colors flex items-center gap-1 text-xs font-mono cursor-pointer ${
-                useEmulatorJs
+            {/* Active engine badge */}
+            <div
+              className={`p-1.5 rounded-lg border flex items-center gap-1 text-xs font-mono ${
+                engine === 'ejs'
                   ? 'bg-purple-950 border-[#a855f7] text-[#a855f7]'
-                  : 'bg-zinc-900/80 border-zinc-800 text-zinc-400 hover:text-white'
+                  : 'bg-zinc-900/80 border-zinc-800 text-zinc-400'
               }`}
-              title="Toggle Core Engine (EmulatorJS Core / Hardware Runner)"
+              title={
+                engine === 'ejs'
+                  ? isPlayCore
+                    ? 'Play! PlayStation 2 WebAssembly core (experimental)'
+                    : `EmulatorJS WebAssembly core (${CONSOLES[game.consoleId].ejsCore})`
+                  : 'Built-in arcade demo (this card has no ROM file)'
+              }
             >
               <Cpu className="w-4 h-4" />
-              <span className="hidden lg:inline">{useEmulatorJs ? 'EJS Core' : 'Vibe Core'}</span>
-            </button>
+              <span className="hidden lg:inline">{engine === 'ejs' ? (isPlayCore ? 'Play! Core' : 'EJS Core') : 'Demo'}</span>
+            </div>
 
             {/* Virtual Gamepad Toggle */}
             <button
@@ -653,15 +864,38 @@ export const Player: React.FC<PlayerProps> = ({
       <div className="relative max-w-full max-h-full flex items-center justify-center p-2 sm:p-6">
         <div className="w-[85vw] max-w-4xl aspect-[4/3] relative rounded-2xl overflow-hidden shadow-[0_0_80px_rgba(0,0,0,0.9)] border-4 border-[#1c192e]">
           <CrtOverlay settings={crtSettings} className="w-full h-full" isMonitorFrame={true}>
-            {useEmulatorJs ? (
-              <div className="w-full h-full relative bg-black flex items-center justify-center">
-                {emulatorJsLoading && (
-                  <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/90 z-20 text-white font-mono text-xs">
-                    <span className="text-[#a855f7] animate-pulse mb-2">INITIALIZING HARDWARE CORE...</span>
-                    <span>Loading WebAssembly Emulation Module</span>
+            {engine === 'resolving' ? (
+              <div className="w-full h-full bg-black flex items-center justify-center font-mono text-xs text-[#a855f7] animate-pulse">
+                READING CARTRIDGE...
+              </div>
+            ) : engine === 'ejs' ? (
+              <div className="w-full h-full relative bg-black">
+                <iframe
+                  key={`${game.id}-${frameNonce}`}
+                  ref={frameRef}
+                  src={isPlayCore ? '/ps2.html' : '/emulator.html'}
+                  title={`${game.title} emulator`}
+                  allow="autoplay; fullscreen; gamepad; screen-wake-lock"
+                  className="w-full h-full border-0 block bg-black"
+                />
+                {coreStatus === 'booting' && (
+                  <div className="absolute top-3 left-1/2 -translate-x-1/2 z-20 px-3 py-1 rounded-full bg-black/80 border border-purple-800/60 font-mono text-[10px] text-[#a855f7] animate-pulse pointer-events-none">
+                    Loading {CONSOLES[game.consoleId].shortName} WebAssembly core…
                   </div>
                 )}
-                <div id="ejs-game-container" ref={ejsContainerRef} className="w-full h-full" />
+                {coreStatus === 'error' && (
+                  <div className="absolute inset-0 z-20 flex flex-col items-center justify-center gap-3 bg-black/90 text-center px-6">
+                    <AlertTriangle className="w-8 h-8 text-red-400" />
+                    <span className="font-retro text-xs text-red-300">CORE FAILED TO START</span>
+                    <span className="font-mono text-[11px] text-zinc-400 max-w-sm">{coreError}</span>
+                    <button
+                      onClick={handlePlayDemoInstead}
+                      className="mt-2 px-4 py-2 text-[10px] font-retro text-white bg-[#a855f7] hover:bg-[#9333ea] rounded-lg cursor-pointer"
+                    >
+                      PLAY ARCADE DEMO INSTEAD
+                    </button>
+                  </div>
+                )}
               </div>
             ) : (
               <canvas
@@ -768,6 +1002,23 @@ export const Player: React.FC<PlayerProps> = ({
                 <div className="w-3 h-3 rounded-full bg-zinc-800" />
               </div>
             </div>
+          </div>
+
+          {/* Select / Start */}
+          <div className="pointer-events-auto flex items-center gap-3 mb-4">
+            {(['SELECT', 'START'] as const).map((btn) => (
+              <button
+                key={btn}
+                onMouseDown={() => handleVirtualButton(btn, true)}
+                onMouseUp={() => handleVirtualButton(btn, false)}
+                onMouseLeave={() => handleVirtualButton(btn, false)}
+                onTouchStart={() => handleVirtualButton(btn, true)}
+                onTouchEnd={() => handleVirtualButton(btn, false)}
+                className="px-3 py-1.5 rounded-full bg-zinc-800/90 active:bg-[#a855f7] border border-zinc-600 text-zinc-300 font-mono text-[9px] tracking-wider shadow"
+              >
+                {btn}
+              </button>
+            ))}
           </div>
 
           {/* Action Buttons Wing (Themed) */}
@@ -881,21 +1132,65 @@ export const Player: React.FC<PlayerProps> = ({
           showHud ? 'opacity-100' : 'opacity-0 pointer-events-none'
         }`}
       >
-        <span>
-          <kbd className="px-1 py-0.5 bg-zinc-800 rounded text-zinc-300">Arrows / WASD</kbd> Move
-        </span>
-        <span>
-          <kbd className="px-1 py-0.5 bg-zinc-800 rounded text-zinc-300">Z / Space</kbd> Fire
-        </span>
-        <span>
-          <kbd className="px-1 py-0.5 bg-zinc-800 rounded text-zinc-300">Backspace</kbd> Rewind
-        </span>
-        <span>
-          <kbd className="px-1 py-0.5 bg-zinc-800 rounded text-zinc-300">F5</kbd> Save
-        </span>
-        <span>
-          <kbd className="px-1 py-0.5 bg-zinc-800 rounded text-zinc-300">F8</kbd> Load
-        </span>
+        {engine === 'ejs' && isPlayCore ? (
+          <>
+            <span>
+              <kbd className="px-1 py-0.5 bg-zinc-800 rounded text-zinc-300">Arrows</kbd> D-Pad
+            </span>
+            <span>
+              <kbd className="px-1 py-0.5 bg-zinc-800 rounded text-zinc-300">Z</kbd> ✕{' '}
+              <kbd className="px-1 py-0.5 bg-zinc-800 rounded text-zinc-300">X</kbd> ○{' '}
+              <kbd className="px-1 py-0.5 bg-zinc-800 rounded text-zinc-300">A</kbd> □{' '}
+              <kbd className="px-1 py-0.5 bg-zinc-800 rounded text-zinc-300">S</kbd> △
+            </span>
+            <span>
+              <kbd className="px-1 py-0.5 bg-zinc-800 rounded text-zinc-300">1 2 / 8 9</kbd> L1 L2 / R1 R2
+            </span>
+            <span>
+              <kbd className="px-1 py-0.5 bg-zinc-800 rounded text-zinc-300">Enter</kbd> Start{' '}
+              <kbd className="px-1 py-0.5 bg-zinc-800 rounded text-zinc-300">Backspace</kbd> Select
+            </span>
+            <span>
+              <kbd className="px-1 py-0.5 bg-zinc-800 rounded text-zinc-300">FHTG</kbd> Stick
+            </span>
+          </>
+        ) : engine === 'ejs' ? (
+          <>
+            <span>
+              <kbd className="px-1 py-0.5 bg-zinc-800 rounded text-zinc-300">Arrows</kbd> D-Pad
+            </span>
+            <span>
+              <kbd className="px-1 py-0.5 bg-zinc-800 rounded text-zinc-300">Z</kbd> A{' '}
+              <kbd className="px-1 py-0.5 bg-zinc-800 rounded text-zinc-300">X</kbd> B
+            </span>
+            <span>
+              <kbd className="px-1 py-0.5 bg-zinc-800 rounded text-zinc-300">Enter</kbd> Start{' '}
+              <kbd className="px-1 py-0.5 bg-zinc-800 rounded text-zinc-300">V</kbd> Select
+            </span>
+          </>
+        ) : (
+          <>
+            <span>
+              <kbd className="px-1 py-0.5 bg-zinc-800 rounded text-zinc-300">Arrows / WASD</kbd> Move
+            </span>
+            <span>
+              <kbd className="px-1 py-0.5 bg-zinc-800 rounded text-zinc-300">Z / Space</kbd> Fire
+            </span>
+            <span>
+              <kbd className="px-1 py-0.5 bg-zinc-800 rounded text-zinc-300">Backspace</kbd> Rewind
+            </span>
+          </>
+        )}
+        {!(engine === 'ejs' && isPlayCore) && (
+          <>
+            <span>
+              <kbd className="px-1 py-0.5 bg-zinc-800 rounded text-zinc-300">F5</kbd> Save
+            </span>
+            <span>
+              <kbd className="px-1 py-0.5 bg-zinc-800 rounded text-zinc-300">F8</kbd> Load
+            </span>
+          </>
+        )}
       </div>
     </div>
   );

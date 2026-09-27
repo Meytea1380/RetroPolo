@@ -15,6 +15,7 @@ export const CONSOLES: Record<ConsoleId, ConsoleMeta> = {
     icon: 'Gamepad2',
     extensions: ['.nes'],
     coreName: 'fceumm',
+    ejsCore: 'nes',
     nativeAspect: '4:3',
   },
   snes: {
@@ -30,6 +31,7 @@ export const CONSOLES: Record<ConsoleId, ConsoleMeta> = {
     icon: 'Tv',
     extensions: ['.smc', '.sfc', '.fig'],
     coreName: 'snes9x',
+    ejsCore: 'snes',
     nativeAspect: '4:3',
   },
   gb: {
@@ -45,6 +47,7 @@ export const CONSOLES: Record<ConsoleId, ConsoleMeta> = {
     icon: 'Smartphone',
     extensions: ['.gb'],
     coreName: 'gambatte',
+    ejsCore: 'gb',
     nativeAspect: '10:9',
   },
   gbc: {
@@ -60,6 +63,7 @@ export const CONSOLES: Record<ConsoleId, ConsoleMeta> = {
     icon: 'Sparkles',
     extensions: ['.gbc'],
     coreName: 'gambatte',
+    ejsCore: 'gb',
     nativeAspect: '10:9',
   },
   gba: {
@@ -75,6 +79,7 @@ export const CONSOLES: Record<ConsoleId, ConsoleMeta> = {
     icon: 'Radio',
     extensions: ['.gba'],
     coreName: 'mgba',
+    ejsCore: 'gba',
     nativeAspect: '3:2',
   },
   genesis: {
@@ -90,6 +95,7 @@ export const CONSOLES: Record<ConsoleId, ConsoleMeta> = {
     icon: 'Disc',
     extensions: ['.md', '.bin', '.gen', '.smd'],
     coreName: 'genesis_plus_gx',
+    ejsCore: 'segaMD',
     nativeAspect: '4:3',
   },
   n64: {
@@ -105,6 +111,7 @@ export const CONSOLES: Record<ConsoleId, ConsoleMeta> = {
     icon: 'Box',
     extensions: ['.z64', '.n64', '.v64'],
     coreName: 'mupen64plus_next',
+    ejsCore: 'n64',
     nativeAspect: '4:3',
   },
   ps1: {
@@ -120,6 +127,24 @@ export const CONSOLES: Record<ConsoleId, ConsoleMeta> = {
     icon: 'Disc3',
     extensions: ['.chd', '.cue', '.iso', '.pbp'],
     coreName: 'mednafen_psx_hw',
+    ejsCore: 'psx',
+    nativeAspect: '4:3',
+  },
+  ps2: {
+    id: 'ps2',
+    name: 'PlayStation 2',
+    shortName: 'PS2',
+    generation: '6th Gen (2000)',
+    year: 2000,
+    color: '#6366f1',
+    badgeBg: 'bg-indigo-500/10 text-indigo-400 border-indigo-500/30',
+    borderColor: 'border-indigo-500',
+    glowColor: 'rgba(99, 102, 241, 0.4)',
+    icon: 'Disc3',
+    extensions: ['.iso', '.cso', '.chd', '.isz', '.elf'],
+    coreName: 'play',
+    ejsCore: '',
+    emulator: 'playjs',
     nativeAspect: '4:3',
   },
 };

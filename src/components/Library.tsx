@@ -90,6 +90,7 @@ export const Library: React.FC<LibraryProps> = ({
     { id: 'genesis', label: 'Genesis' },
     { id: 'n64', label: 'N64' },
     { id: 'ps1', label: 'PS1' },
+    { id: 'ps2', label: 'PS2' },
   ];
 
   return (
