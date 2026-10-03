@@ -28,6 +28,7 @@
 ├── public/
 │   ├── emulator.html            # Isolated EmulatorJS host page (loaded in an iframe by Player.tsx)
 │   ├── ps2.html                 # Play! PlayStation 2 host page (same postMessage protocol)
+│   ├── emulatorjs/              # Vendored EmulatorJS runtime + libretro cores (see npm run fetch:cores)
 │   ├── ps2/                     # Vendored Play! WebAssembly core (Play.js, Play.wasm, LICENSE.txt)
 │   ├── test-roms/               # Homebrew test ROMs rebuilt on server start (see testRoms.ts)
 │   │   ├── retro_pilot.nes      # Runnable NROM test cart (text, movable sprite, beep)
@@ -74,6 +75,7 @@ The server runs on **port 3000** using Express with Vite middlewares mounted in 
 4. Static Mounts:
    - `/uploads` -> points to `public/uploads`
    - `/test-roms` -> points to `public/test-roms`
+   - `/emulatorjs` -> points to `public/emulatorjs` with `Cache-Control: immutable, max-age=1y` (vendored EmulatorJS runtime + cores)
 
 ---
 
@@ -150,7 +152,7 @@ Zero external audio MP3/WAV dependencies are required. All sound effects are gen
    - ROM source is resolved in this order: IndexedDB blob (`retroDb.getRom(game.id)`) -> `game.romBlob` -> `game.romUrl` (server uploads / test ROMs).
    - EmulatorJS runs inside an isolated iframe (`public/emulator.html`), one iframe per play session, because EmulatorJS keeps global state and cannot be torn down cleanly.
    - The Player drives it over `postMessage` (`init`, then `cmd` RPCs: `saveState`, `loadState`, `screenshot`, `setVolume`, `setSpeed`, `restart`, `input`). The frame answers with `ready`, `started`, `error`, `result` and forwards the `F5`/`F8` hotkeys.
-   - `ConsoleMeta.ejsCore` maps each console to its EmulatorJS system id (`nes`, `snes`, `gb`, `gba`, `segaMD`, `n64`, `psx`); cores are fetched from `cdn.emulatorjs.org` (internet connection required).
+   - `ConsoleMeta.ejsCore` maps each console to its EmulatorJS system id (`nes`, `snes`, `gb`, `gba`, `segaMD`, `n64`, `psx`); the runtime and cores are vendored in `public/emulatorjs/` and served same-origin, so playing a game needs no internet connection.
    - Save states are the raw core state (`application/octet-stream`) stored in IndexedDB slots 1-3, auto-save every 30s into slot 99.
    - Speed: 1x / 2x / 4x (fast-forward) / 0.5x (slow motion). Physical USB/Bluetooth gamepads work through EmulatorJS' built-in Gamepad API support.
    - The on-screen virtual gamepad sends RetroPad inputs (`simulateInput`).
@@ -159,6 +161,16 @@ Zero external audio MP3/WAV dependencies are required. All sound effects are gen
 2. **Vibe Core (arcade demo)**
    - Used only for library cards without any ROM file (the built-in demo cards) or when the core fails to start and the user chooses the demo.
    - 60 FPS canvas shooter with rewind (`Backspace`), JSON save states and skinnable gamepad.
+
+### Vendored EmulatorJS runtime and cores
+EmulatorJS normally loads its runtime and libretro cores from `cdn.emulatorjs.org` on every play session. RetroPolo vendors them instead, so nothing is fetched from a third party at runtime:
+
+- `npm run fetch:cores` (`scripts/fetch-emulatorjs-core.mjs`) downloads EmulatorJS `4.2.3` into `public/emulatorjs/4.2.3/`: `loader.js`, `emulator.min.js`, `emulator.min.css`, `version.json`, `compression/*` (the core archives are 7z containers), `localization/*` and the cores themselves. Files already on disk are skipped; pass `--force` to re-download.
+- Cores are the 7 systems in `CONSOLES` plus every alternative offered by the in-game **Core** menu: `fceumm`/`nestopia` (nes), `snes9x` (snes), `gambatte` (gb/gbc), `mgba` (gba), `genesis_plus_gx`/`picodrive` (segaMD), `mupen64plus_next`/`parallel_n64` (n64), `pcsx_rearmed`/`mednafen_psx_hw` (psx). All four builds of each core are kept — `-thread` for the Threads option and `-legacy` when WebGL2 is off — plus `cores/reports/*.json`, which EmulatorJS uses to key its IndexedDB cache. ~50MB total.
+- `public/emulator.html` points `EJS_pathtodata` at `/emulatorjs/4.2.3/` (keep in sync with `VERSION` in the fetch script), and `server.ts` serves `/emulatorjs` with `Cache-Control: immutable, max-age=1y`. Because the version is part of the URL, the first play session transfers a core once and every later session is served entirely from the browser cache, while a version bump lands on a fresh URL instead of racing existing caches.
+- EmulatorJS' "check for updates" ping hardcodes `cdn.emulatorjs.org` and fires on `localhost`, so the fetch script rewrites that one string in `emulator.min.js` to the vendored `version.json`; the script fails loudly if a future EmulatorJS release moves it. No other runtime fetch leaves our origin.
+- EmulatorJS is **GPL-3.0** (the PS2 core below is BSD-2-Clause). The license text is vendored at `public/emulatorjs/LICENSE.txt`, and each core archive carries its own `license.txt` which EmulatorJS surfaces in the menu.
+- `.gitattributes` marks `public/emulatorjs/` as binary so `core.autocrlf` cannot corrupt the 7z archives or WebAssembly modules.
 
 ### PlayStation 2 (Play! core, experimental)
 EmulatorJS has no PS2 core, so PS2 games run on [Play!](https://github.com/jpd002/Play-) (BSD-2-Clause) compiled to WebAssembly:
@@ -209,4 +221,9 @@ npm run build
 
 # Start production server
 npm run start
+
+# Re-download the vendored emulator files (already committed, so only needed to update them)
+npm run fetch:cores   # EmulatorJS runtime + libretro cores -> public/emulatorjs/
+npm run fetch:ps2     # Play! PS2 core -> public/ps2/
+npm run fetch:all     # both
 ```

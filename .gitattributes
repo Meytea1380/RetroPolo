@@ -1,0 +1,4 @@
+# Vendored third-party runtimes and cores are stored byte-for-byte.
+# A CRLF rewrite (core.autocrlf=true on Windows) would corrupt the 7z core
+# archives in public/emulatorjs/*/cores/ and the WebAssembly modules.
+public/emulatorjs/** -text
