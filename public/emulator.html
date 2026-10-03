@@ -22,7 +22,10 @@
        * Frame -> parent:  { type: 'ready' } { type: 'started' } { type: 'error', message }
        *                   { type: 'result', id, ok, data, error } { type: 'hotkey', key }
        */
-      const EJS_CDN = 'https://cdn.emulatorjs.org/stable/data/';
+      // Vendored EmulatorJS runtime + libretro cores (public/emulatorjs/, see scripts/fetch-emulatorjs-core.mjs).
+      // The version is part of the URL so the immutable HTTP cache never serves a stale build.
+      // Keep in sync with VERSION in scripts/fetch-emulatorjs-core.mjs.
+      const EJS_DATA = '/emulatorjs/4.2.3/';
       const post = (msg, transfer) => parent.postMessage(msg, location.origin, transfer || []);
       let started = false;
 
@@ -38,7 +41,7 @@
         window.EJS_gameUrl = gameUrl;
         window.EJS_gameName = opts.gameName || 'game';
         window.EJS_gameID = opts.gameId;
-        window.EJS_pathtodata = EJS_CDN;
+        window.EJS_pathtodata = EJS_DATA;
         window.EJS_startOnLoaded = true;
         window.EJS_color = '#a855f7';
         window.EJS_backgroundColor = '#000000';
@@ -50,8 +53,12 @@
         };
 
         const s = document.createElement('script');
-        s.src = EJS_CDN + 'loader.js';
-        s.onerror = () => post({ type: 'error', message: 'Could not reach the EmulatorJS CDN (check your internet connection).' });
+        s.src = EJS_DATA + 'loader.js';
+        s.onerror = () =>
+          post({
+            type: 'error',
+            message: 'Emulator files are missing from /emulatorjs/ — run "npm run fetch:cores" to vendor them.',
+          });
         document.body.appendChild(s);
       }
 
