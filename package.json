@@ -10,7 +10,9 @@
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
-    "fetch:ps2": "node scripts/fetch-ps2-core.mjs"
+    "fetch:ps2": "node scripts/fetch-ps2-core.mjs",
+    "fetch:cores": "node scripts/fetch-emulatorjs-core.mjs",
+    "fetch:all": "node scripts/fetch-ps2-core.mjs && node scripts/fetch-emulatorjs-core.mjs"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

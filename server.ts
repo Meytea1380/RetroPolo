@@ -15,6 +15,7 @@ const PORT = 3000;
 // Ensure upload and test ROM storage directories exist
 const UPLOADS_DIR = path.join(__dirname, 'public', 'uploads');
 const TEST_ROMS_DIR = path.join(__dirname, 'public', 'test-roms');
+const EMULATORJS_DIR = path.join(__dirname, 'public', 'emulatorjs');
 if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 if (!fs.existsSync(TEST_ROMS_DIR)) fs.mkdirSync(TEST_ROMS_DIR, { recursive: true });
 
@@ -28,7 +29,7 @@ for (const stale of ['speedway.gba', 'sonic_strike.bin']) {
 }
 
 // Cross-origin isolation: the PS2 core (Play!) runs WebAssembly pthreads and needs SharedArrayBuffer.
-// "credentialless" keeps third-party CDNs (EmulatorJS cores, Google Fonts) loadable without CORP headers.
+// "credentialless" keeps third-party CDNs (Google Fonts) loadable without CORP headers.
 app.use((_req, res, next) => {
   res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
   res.setHeader('Cross-Origin-Embedder-Policy', 'credentialless');
@@ -40,6 +41,12 @@ app.use(express.json());
 // Serve uploaded ROMs and test ROMs statically
 app.use('/uploads', express.static(UPLOADS_DIR));
 app.use('/test-roms', express.static(TEST_ROMS_DIR));
+
+// Vendored EmulatorJS runtime + cores (~50MB of 7z archives) under /emulatorjs/<version>/. The version
+// is part of the URL (see scripts/fetch-emulatorjs-core.mjs), so immutable long-lived caching is safe:
+// a core is transferred on the first play session and served from the browser cache ever after, while a
+// version bump lands on a fresh URL instead of racing clients' caches.
+app.use('/emulatorjs', express.static(EMULATORJS_DIR, { maxAge: '1y', immutable: true }));
 
 // Configure multer storage
 const storage = multer.diskStorage({
